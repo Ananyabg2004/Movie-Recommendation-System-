@@ -1,0 +1,560 @@
+import streamlit as st
+import pandas as pd
+import re
+import speech_recognition as sr
+import cv2
+from deepface import DeepFace
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import random
+import time
+from streamlit_chat import message
+from gtts import gTTS
+import os
+from PIL import Image
+
+# Load dataset
+try:
+    df = pd.read_csv("movies.csv")
+except FileNotFoundError:
+    st.error("Error: 'movies.csv' not found. Please make sure the file is in the same directory as the script.")
+    st.stop()
+except Exception as e:
+    st.error(f"Error loading 'movies.csv': {e}")
+    st.stop()
+
+df['Release_Date'] = pd.to_datetime(df['Release_Date'], dayfirst=True, errors='coerce')
+df['Release_Year'] = df['Release_Date'].dt.year
+df['Vote_Count'] = pd.to_numeric(df['Vote_Count'], errors='coerce')
+df['Vote_Average'] = pd.to_numeric(df['Vote_Average'], errors='coerce')
+df['Categories'] = df['Categories'].fillna('Unknown')
+
+default_poster = "https://via.placeholder.com/150"
+df['Poster_Url'] = df['Poster_Url'].fillna(default_poster)
+
+def simple_clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'[^a-z\s]', '', text)
+    return text
+
+df['Cleaned_Overview'] = df['Overview'].apply(simple_clean_text)
+df['Processed_Categories'] = df['Categories'].apply(lambda x: ' '.join(str(x).lower().replace(' ', '').split(',')))
+df['Text_Features'] = df['Cleaned_Overview'] + ' ' + df['Processed_Categories']
+
+tfidf = TfidfVectorizer(stop_words='english')
+tfidf_matrix = tfidf.fit_transform(df['Text_Features'].fillna(''))
+
+def recommend_movies(movie_name, num_recommendations=15):
+    movie_name = movie_name.lower().strip()
+    if not movie_name or not df['Title'].str.lower().str.contains(movie_name).any():
+        return pd.DataFrame(columns=['Title', 'Poster_Url'])
+    query_vector = tfidf.transform([movie_name])
+    cosine_sim = cosine_similarity(query_vector, tfidf_matrix).flatten()
+    similar_indices = cosine_sim.argsort()[-(num_recommendations + 1):-1][::-1]
+    recommendations = df.iloc[similar_indices][['Title', 'Poster_Url']]
+    return recommendations if not recommendations.empty else pd.DataFrame(columns=['Title', 'Poster_Url'])
+
+def recommend_by_year(year, num_recommendations=5):
+    try:
+        year = int(year)
+        year_movies = df[df['Release_Year'] == year]
+        if not year_movies.empty:
+            return year_movies.sample(n=min(num_recommendations, len(year_movies)))[['Title', 'Poster_Url']]
+        else:
+            return pd.DataFrame(columns=['Title', 'Poster_Url'])
+    except ValueError:
+        return pd.DataFrame(columns=['Title', 'Poster_Url'])
+
+def recognize_speech():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        st.write("🎤 Listening... Speak now.")
+        try:
+            audio = recognizer.listen(source, timeout=5)
+            recognized_text = recognizer.recognize_google(audio)
+            st.success(f"🗣 Recognized: {recognized_text}")
+            return recognized_text
+        except sr.UnknownValueError:
+            st.error("❌ Could not understand the audio.")
+        except sr.RequestError:
+            st.error("❌ Could not connect to speech recognition service.")
+        return None
+
+def detect_mood():
+    try:
+        cap = cv2.VideoCapture(0)
+        st.write("📷 Opening Camera for Mood Detection...")
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            try:
+                result = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False)
+                return result[0]['dominant_emotion'] if result else None
+            except Exception as e:
+                st.error(f"Error during mood detection analysis: {e}")
+                return None
+        else:
+            st.error("❌ Could not access the camera.")
+            return None
+    except Exception as e:
+        st.error(f"Error initializing camera: {e}")
+        return None
+
+def recommend_by_mood(mood):
+    mood_map = {'happy': 'comedy', 'sad': 'drama', 'angry': 'action', 'neutral': 'romance'}
+    category = mood_map.get(mood, 'drama')
+    return df[df['Categories'].str.contains(category, case=False, na=False)].head(10)[['Title', 'Poster_Url']]
+
+def pronounce_text(text, key):
+    try:
+        tts = gTTS(text=text, lang='en')
+        filename = f"temp_audio_{key}.mp3"
+        tts.save(filename)
+        st.audio(filename, format="audio/mp3")
+        os.remove(filename)
+    except Exception as e:
+        st.error(f"Error during text-to-speech: {e}")
+
+def generate_chatbot_response(prompt):
+    prompt_lower = prompt.lower()
+    st.session_state.recommended_movies = None  # Reset recommendations
+
+    if "recommend" in prompt_lower:
+        genre_match = re.search(r"(action|comedy|drama|horror|romance|sci-fi|animation|thriller|mystery|adventure)", prompt_lower)
+        year_match = re.search(r"(\d{4})", prompt_lower)
+        exclude_match = re.search(r"exclude (action|comedy|drama|horror|romance|sci-fi|animation|thriller|mystery|adventure)", prompt_lower)
+
+        recommendations = df.copy()
+
+        if genre_match:
+            genre = genre_match.group(1)
+            recommendations = recommendations[recommendations['Categories'].str.contains(genre, case=False, na=False)]
+            if recommendations.empty:
+                return f"Sorry, I don't have any recommendations for the '{genre.capitalize()}' genre right now."
+
+        if year_match:
+            year = int(year_match.group(1))
+            year_recommendations = recommend_by_year(year)
+            if year_recommendations.empty:
+                return f"No movies found for the year {year}."
+            else:
+                st.session_state.recommended_movies = year_recommendations
+                return f"Here are some movies from {year}:"
+
+        if exclude_match:
+            excluded_genre = exclude_match.group(1)
+            recommendations = recommendations[~recommendations['Categories'].str.contains(excluded_genre, case=False, na=False)]
+            if recommendations.empty:
+                return f"No movies found after excluding the '{excluded_genre.capitalize()}' genre."
+
+        if not recommendations.empty:
+            top_recommendations = recommendations.sample(n=min(3, len(recommendations)))[['Title', 'Poster_Url']]
+            st.session_state.recommended_movies = top_recommendations
+            if genre_match:
+                return f"Here are some recommendations in the '{genre.capitalize()}' genre:"
+            else:
+                return "Here are some movie recommendations based on your request:"
+        else:
+            return "I couldn't find any movies matching your criteria. Could you be more specific?"
+
+    elif "tell me about" in prompt_lower:
+        movie_title = prompt_lower.split("tell me about")[-1].strip().replace("movie", "").strip()
+        movie_info = df[df['Title'].str.lower() == movie_title.lower()]
+        if not movie_info.empty:
+            overview = movie_info['Overview'].iloc[0]
+            categories = movie_info['Categories'].iloc[0]
+            rating = movie_info['Vote_Average'].iloc[0] if pd.notna(movie_info['Vote_Average'].iloc[0]) else "Not rated"
+            poster = movie_info['Poster_Url'].iloc[0]
+            st.image(poster, width=100)
+            return f"'{movie_title.title()}' is a {categories} movie released in {movie_info['Release_Year'].iloc[0] if pd.notna(movie_info['Release_Year'].iloc[0]) else 'Unknown'}. It has an average rating of {rating}. Here's a brief overview: {overview} ℹ️"
+        else:
+            return f"Sorry, I don't have information about '{movie_title}'. 😞"
+
+    elif re.search(r"what are some (top|best|highly rated) movies", prompt_lower):
+        top_rated = df.nlargest(3, 'Vote_Average')[['Title', 'Poster_Url']]
+        st.session_state.recommended_movies = top_rated
+        return "Here are some highly-rated movies you might enjoy:"
+
+    elif "recommend based on my mood" in prompt_lower or "what should i watch based on how i feel" in prompt_lower:
+        mood = detect_mood()
+        if mood:
+            mood_recommendations = recommend_by_mood(mood)
+            st.session_state.recommended_movies = mood_recommendations
+            return f"Based on your detected mood ({mood.capitalize()}), here are some recommendations:"
+        else:
+            return "I couldn't detect your mood. How are you feeling?"
+
+    elif re.search(r"recommend movies from (\d{4})", prompt_lower):
+        year = re.search(r"(\d{4})", prompt_lower).group(1)
+        year_recommendations = recommend_by_year(year)
+        if not year_recommendations.empty:
+            st.session_state.recommended_movies = year_recommendations
+            return f"Here are some movies from {year}:"
+        else:
+            return f"No movies found for the year {year}."
+
+    else:
+        return "I'm still learning to understand more complex requests! Could you try rephrasing?"
+
+# Streamlit UI Config
+st.set_page_config(page_title="Movie Recommendation System", layout="wide")
+
+# Custom CSS
+st.markdown(
+    """
+    <style>
+    .sidebar .sidebar-content {
+        background-color: #f0f2f6;
+        padding-top: 1rem;
+    }
+    .sidebar h1, .sidebar h2, .sidebar h3, .sidebar h4, .sidebar h5, .sidebar h6, .sidebar p, .sidebar a, .sidebar button {
+        color: #333;
+    }
+    .stButton>button {
+        color: #fff;
+        background-color: #007bff;
+        border: none;
+        border-radius: 5px;
+        padding: 0.5rem 1rem;
+        margin-bottom: 0.5rem;
+        cursor: pointer;
+        width: 100%;
+    }
+    .stButton>button:hover {
+        background-color: #0056b3;
+    }
+    .movie-poster {
+        border-radius: 5px;
+        box-shadow: 2px 2px 5px #ccc;
+        margin-bottom: 1rem;
+    }
+    .comment-box {
+        border: 1px solid #ddd;
+        padding: 0.5rem;
+        border-radius: 5px;
+        margin-bottom: 0.5rem;
+        background-color: #fff;
+        color: #333; /* Ensure text color is visible */
+    }
+    .chat-message.user {
+        background-color: #e6f7ff;
+        border-radius: 5px;
+        padding: 0.5rem;
+        margin-bottom: 0.5rem;
+        color: #333; /* Ensure user message text is visible */
+    }
+    .chat-message.bot {
+        background-color: #f9f9f9;
+        border-radius: 5px;
+        padding: 0.5rem;
+        margin-bottom: 0.5rem;
+        color: #333; /* Ensure bot message text is visible */
+    }
+    .avatar {
+        border-radius: 50%;
+        margin-right: 0.5rem;
+        vertical-align: middle;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Session State Initialization
+if "page_state" not in st.session_state:
+    st.session_state.page_state = "welcome"
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if "user_data" not in st.session_state:
+    st.session_state.user_data = {}
+
+if "movie_interactions" not in st.session_state:
+    st.session_state.movie_interactions = {}
+    for title in df['Title'].unique():
+        st.session_state.movie_interactions[title] = {
+            "likes": random.randint(5, 50),
+            "dislikes": random.randint(0, 20),
+            "comments": random.sample([
+                "A must-watch!",
+                "Really enjoyed this movie.",
+                "Not my cup of tea.",
+                "Great acting and storyline.",
+                "Could have been better.",
+                "Loved the visuals!",
+                "A classic.",
+                "Surprisingly good.",
+                "Waste of time.",
+                "Highly recommended!"
+            ], random.randint(0, 3))
+        }
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "chatbot_thinking" not in st.session_state:
+    st.session_state.chatbot_thinking = False
+
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "home"
+
+# Default Welcome GIF
+default_welcome_gif = "giphyy.gif" # Replace with a better welcome GIF
+
+# Sidebar Navigation with Emojis
+def navigation():
+    with st.sidebar:
+        st.title("🎬 Movie Recommender")
+        if st.button("🏠 Home"):
+            st.session_state.current_page = "home"
+        if st.button("👤 User Profile"):
+            st.session_state.current_page = "user_profile"
+        if st.button("⚙️ Settings"):
+            st.session_state.current_page = "settings"
+        if st.button("🔎🎤 Search/Speak Movie"):
+            st.session_state.current_page = "search_movie"
+        if st.button("📂 Browse Categories"):
+            st.session_state.current_page = "browse_categories"
+        if st.button("😊 Mood Based Recs"):
+            st.session_state.current_page = "mood_recommendation"
+        if st.button("🤖 Chatbot"):
+            st.session_state.current_page = "chatbot"
+        if st.button("🚪 Logout"):
+            st.session_state.authenticated = False
+            st.session_state.page_state = "welcome"
+            st.session_state.current_page = "home" # Reset page
+            st.rerun()
+
+# Welcome Page
+if st.session_state.page_state == "welcome":
+    st.image(default_welcome_gif, use_column_width=True)
+    if st.button("Click to continue"):
+        st.session_state.page_state = "authentication"
+        st.rerun()
+
+# Authentication Page (Login/Sign Up)
+elif st.session_state.page_state == "authentication":
+    authentication_option = st.radio("Choose an option:", ("Login", "Sign Up"))
+    if authentication_option == "Login":
+        st.title("🔐 Login to Your Account")
+        username = st.text_input("Username:")
+        password = st.text_input("Password:", type="password")
+        if st.button("Login"):
+            if username in st.session_state.user_data and st.session_state.user_data[username]["password"] == password:
+                st.session_state.authenticated = True
+                st.session_state.page_state = "main"
+                st.session_state.current_page = "home" # Set initial page after login
+                st.success("✅ Login successful!")
+                st.rerun()
+            else:
+                st.error("❌ Invalid username or password.")
+    elif authentication_option == "Sign Up":
+        st.title("📝 Create an Account")
+        new_username = st.text_input("Choose a Username:")
+        new_password = st.text_input("Choose a Password:", type="password")
+        if st.button("Sign Up"):
+            if new_username and new_password:
+                st.session_state.user_data[new_username] = {"password": new_password}
+                st.success("✅ Account created successfully! You can now log in.")
+                st.session_state.page_state = "authentication" # Go back to authentication
+                st.rerun()
+            else:
+                st.error("❌ Please enter both username and password.")
+
+# Main App After Login
+elif st.session_state.page_state == "main" and st.session_state.authenticated:
+    navigation()
+
+    if st.session_state.current_page == "home":
+        st.title("🎬 Welcome to the Movie Recommendation System!")
+        st.write("Explore different ways to find movies you'll love.")
+
+    elif st.session_state.current_page == "user_profile":
+        st.subheader("👤 User Profile")
+        if st.session_state.user_data:
+            username = list(st.session_state.user_data.keys())[0] # Assuming only one user logged in
+            st.write(f"👋 Welcome, *{username}*!")
+            st.subheader("Your Preferences:")
+            st.write("- *Favorite Genres:* (Coming Soon)")
+            st.write("- *Movies You've Liked:* (Coming Soon)")
+            st.write("- *Movies You've Disliked:* (Coming Soon)")
+            st.subheader("Account Actions:")
+            if st.button("✏️ Edit Profile (Coming Soon)"):
+                st.info("This feature is under development.")
+            if st.button("🔒 Change Password (Coming Soon)"):
+                st.info("This feature is under development.")
+
+    elif st.session_state.current_page == "settings":
+        st.subheader("⚙️ Settings")
+        st.subheader("Display:")
+        theme_option = st.selectbox("Choose Theme (Coming Soon):", ["Light", "Dark"])
+        st.write(f"Selected Theme: {theme_option}")
+        st.subheader("Recommendations:")
+        genre_preference = st.multiselect("Preferred Genres (Coming Soon):", ["Action", "Comedy", "Drama", "Horror", "Romance", "Sci-Fi", "Animation", "Thriller", "Mystery", "Adventure"])
+        st.write(f"Your Preferred Genres: {', '.join(genre_preference) or 'Not specified'}")
+        st.subheader("Notifications:")
+        notifications_enabled = st.checkbox("Enable Email Notifications (Coming Soon)")
+        st.write(f"Email Notifications: {'Enabled' if notifications_enabled else 'Disabled'}")
+        if st.button("💾 Save Changes (Coming Soon)"):
+            st.info("Your settings will be saved here.")
+
+    elif st.session_state.current_page == "search_movie":
+        st.subheader("🔎 Find Movies")
+        col1, col2 = st.columns([6, 1])
+        with col1:
+            movie_input = st.text_input("Enter a movie name:", value=st.session_state.get("spoken_movie", ""))
+            st.session_state["spoken_movie"] = ""
+        with col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🎤 ", help="Speak the movie name"):
+                spoken_movie = recognize_speech()
+                if spoken_movie:
+                    st.session_state["spoken_movie"] = spoken_movie
+                    st.rerun()
+
+        if movie_input:
+            recommendations = recommend_movies(movie_input)
+            if not recommendations.empty:
+                st.subheader("🎬 Recommendations based on your input:")
+                cols = st.columns(5)
+                for i, (_, row) in enumerate(recommendations.iterrows()):
+                    movie_id = row['Title']
+                    with cols[i % 5]:
+                        st.image(row['Poster_Url'], width=150, caption=row['Title'], use_column_width=True)
+                        like_col, dislike_col = st.columns([1, 1])
+                        with like_col:
+                            if st.button(f"👍 {st.session_state.movie_interactions.get(movie_id, {}).get('likes', 0)}", key=f"like_{movie_id}"):
+                                st.session_state.movie_interactions.setdefault(movie_id, {"likes": random.randint(5, 50), "dislikes": random.randint(0, 20), "comments": []})["likes"] += 1
+                                st.rerun()
+                        with dislike_col:
+                            if st.button(f"👎 {st.session_state.movie_interactions.get(movie_id, {}).get('dislikes', 0)}", key=f"dislike_{movie_id}"):
+                                st.session_state.movie_interactions.setdefault(movie_id, {"likes": random.randint(5, 50), "dislikes": random.randint(0, 20), "comments": []})["dislikes"] += 1
+                                st.rerun()
+                        comment = st.text_input("💬 Add a comment:", key=f"comment_input_{movie_id}", label_visibility="collapsed")
+                        if st.button("Post", key=f"post_comment_{movie_id}"):
+                            if comment:
+                                st.session_state.movie_interactions.setdefault(movie_id, {"likes": random.randint(5, 50), "dislikes": random.randint(0, 20), "comments": []})["comments"].append(comment)
+                                st.success("Comment posted!")
+                                st.rerun()
+                        if st.session_state.movie_interactions.get(movie_id, {}).get('comments'):
+                            with st.expander("🗨 View Comments"):
+                                for c in st.session_state.movie_interactions[movie_id]["comments"]:
+                                    st.markdown(f'<div class="comment-box">{c}</div>', unsafe_allow_html=True)
+                        share_url = f"https://yourapp.streamlit.app/?movie={movie_id.replace(' ', '%20')}"
+                        st.markdown(f"[🔗 Share]({share_url})", unsafe_allow_html=True)
+            else:
+                st.write("⚠️ No recommendations found. Try another movie.")
+
+    elif st.session_state.current_page == "browse_categories":
+        st.subheader("📚 Browse by Categories")
+        category_mapping = {
+            "🎭 Drama": "drama",
+            "😂 Comedy": "comedy",
+            "🔥 Action": "action",
+            "👻 Horror": "horror",
+            "❤️ Romance": "romance",
+            "🚀 Sci-Fi": "sci-fi",
+            "🎨 Animation": "animation",
+            "🔪 Thriller": "thriller",
+            "🕵 Mystery": "mystery",
+            "🏞 Adventure": "adventure",
+            "📺 Your Watch History": "Watch History" # Placeholder
+        }
+
+        category_cols = st.columns(5)
+        for i, (category, key) in enumerate(category_mapping.items()):
+            with category_cols[i % 5]:
+                if st.button(category, key=f"cat_{key}"):
+                    st.session_state.selected_category = key
+                    st.rerun()
+
+        if "selected_category" in st.session_state:
+            category = st.session_state.selected_category
+            if category == "Watch History":
+                st.subheader("📺 Your Watch History (Feature in Development)")
+                st.info("This feature to track your watch history is currently under development.")
+            else:
+                category_movies = df[df['Categories'].str.contains(category, case=False, na=False)]
+                if not category_movies.empty:
+                    st.subheader(f"🎞 {category.capitalize()} Movies")
+                    movie_cols = st.columns(5)
+                    for i, (_, row) in enumerate(category_movies.iterrows()):
+                        movie_id = row['Title']
+                        with movie_cols[i % 5]:
+                            st.image(row['Poster_Url'], width=150, caption=row['Title'], use_column_width=True)
+                            like_col, dislike_col = st.columns([1, 1])
+                            with like_col:
+                                if st.button(f"👍 {st.session_state.movie_interactions.get(movie_id, {}).get('likes', 0)}", key=f"like_cat_{movie_id}"):
+                                    st.session_state.movie_interactions.setdefault(movie_id, {"likes": random.randint(5, 50), "dislikes": random.randint(0, 20), "comments": []})["likes"] += 1
+                                    st.rerun()
+                            with dislike_col:
+                                if st.button(f"👎 {st.session_state.movie_interactions.get(movie_id, {}).get('dislikes', 0)}", key=f"dislike_cat_{movie_id}"):
+                                    st.session_state.movie_interactions.setdefault(movie_id, {"likes": random.randint(5, 50), "dislikes": random.randint(0, 20), "comments": []})["dislikes"] += 1
+                                    st.rerun()
+                            comment = st.text_input("💬 Add a comment:", key=f"comment_input_cat_{movie_id}", label_visibility="collapsed")
+                            if st.button("Post", key=f"post_comment_cat_{movie_id}"):
+                                if comment:
+                                    st.session_state.movie_interactions.setdefault(movie_id, {"likes": random.randint(5, 50), "dislikes": random.randint(0, 20), "comments": []})["comments"].append(comment)
+                                    st.success("Comment posted!")
+                                    st.rerun()
+                            if st.session_state.movie_interactions.get(movie_id, {}).get('comments'):
+                                with st.expander("🗨 View Comments"):
+                                    for c in st.session_state.movie_interactions[movie_id]["comments"]:
+                                        st.markdown(f'<div class="comment-box">{c}</div>', unsafe_allow_html=True)
+                            share_url = f"https://yourapp.streamlit.app/?movie= {movie_id.replace(' ', '%20')}"
+                            st.markdown(f"[🔗 Share]({share_url})", unsafe_allow_html=True)
+                else:
+                    st.info(f"No movies found in the {category.capitalize()} category.")
+
+    elif st.session_state.current_page == "mood_recommendation":
+        st.subheader("😊 Get Recommendations Based on Your Mood")
+        if st.button("🎭 Detect My Mood"):
+            mood = detect_mood()
+            if mood:
+                st.success(f"Detected Mood: {mood.capitalize()}")
+                st.subheader(f"🎬 Movies for your {mood.capitalize()} mood:")
+                results = recommend_by_mood(mood)
+                if not results.empty:
+                    mood_cols = st.columns(5)
+                    for i, (_, row) in enumerate(results.iterrows()):
+                        movie_id = row['Title']
+                        with mood_cols[i % 5]:
+                            st.image(row['Poster_Url'], width=150, caption=row['Title'], use_column_width=True)
+                else:
+                    st.info(f"No specific recommendations for the {mood.capitalize()} mood right now. Enjoy a drama!")
+            else:
+                st.error("Could not detect your mood. Please ensure your camera is working.")
+
+    elif st.session_state.current_page == "chatbot":
+        st.subheader("🤖 Advanced Chatbot Movie Recommendation")
+
+        user_input = st.text_input("Ask the chatbot for movie recommendations:", key="chatbot_input")
+        if user_input:
+            st.session_state.chat_history.append({"user": user_input})
+            with st.spinner("Thinking... 🧠"):
+                st.session_state.chatbot_thinking = True
+                time.sleep(1)  # Simulate processing time
+                chatbot_response = generate_chatbot_response(user_input)
+                st.session_state.chat_history.append({"bot": chatbot_response, "thinking": True})  # Add thinking status
+                st.session_state.chatbot_thinking = False
+                pronounce_text(user_input, key=f"user_pronounce_{len(st.session_state.chat_history)}")
+                pronounce_text(chatbot_response, key=f"bot_pronounce_{len(st.session_state.chat_history)}")
+
+        st.subheader("Chat History:")
+        for i, chat in enumerate(st.session_state.chat_history):
+            if "user" in chat:
+                st.markdown(f'<div class="chat-message user" style="display: flex; align-items: center; color: #333;">'
+                            f'👤 <b>You:</b> {chat["user"]} 🗣️'
+                            f'</div>', unsafe_allow_html=True)
+            if "bot" in chat:
+                st.markdown(f'<div class="chat-message bot" style="display: flex; align-items: center; color: #333;">'
+                            f'🤖 <b>Bot:</b> {chat["bot"]} 🗣️'
+                            f'</div>', unsafe_allow_html=True)
+                if st.session_state.get("recommended_movies") is not None and not st.session_state.recommended_movies.empty:
+                    st.subheader("🎬 Recommendations:")
+                    cols = st.columns(len(st.session_state.recommended_movies))
+                    for j, (_, recommended_row) in enumerate(st.session_state.recommended_movies.iterrows()):
+                        with cols[j]:
+                            st.image(recommended_row['Poster_Url'], width=150, caption=recommended_row['Title'], use_column_width=True)
+                    st.session_state.recommended_movies = None  # Clear after display
